@@ -192,34 +192,36 @@ async function doSign(authToken, userId) {
   return '签到失败';
 }
 
-// ====== 签到盲盒（第30天发放）：还原自快捷指令 ZEEHO自动签到R.2.1 ======
-// 接口：GET /cfmotoservermine/signin/supplementPrize?supplementDate=<prizeDate>
-// 签名：signatureParam = "appId=<APP_ID>&nonce=<uuid>&timestamp=<秒>"
-//       toSign        = "supplementDate=" + prizeDate + signatureParam + APP_SECRET
-//       sign          = md5(sha1(toSign))          （与签到同型，前缀多 supplementDate）
-// 响应：{ code, message, prizesName }，code="10000" 为领取成功
-// ⚠️ 盲盒在「连续签到第30天」才发放，平时调用会返回 code=40005"不存在的盲盒"。
-//    默认 enabled=false，待连签满30天再打开即可。
+// ====== 签到盲盒（第 30 天发放） ======
+// 接口：GET /cfmotoservermine/H5/signin/lottery?boxType=0
+// 签名：query "boxType=0" 参与 H5 签名（makeSign），user_id 走请求头。
+// 响应：code=10000 领取成功；ALREADY_LOTTERY 今日已开过；NO_LOTTERY 今天无可用盲盒。
+// 说明：旧实现误用了补签接口 /signin/supplementPrize，服务端返回 430/30125 permit error，
+//       真实开盒日也无法领取；此处改用官方 App 当前的开盒接口。
 
 const CLAIM_BOX_ENABLED = true;
 
-/** 连续签到满 30 天时领取补签盲盒（供外部在连签满30天后调用） */
+/** 领取第 30 天盲盒；非开盒日返回“今天无可用盲盒”，不影响签到 */
 async function claimBoxPrize(authToken, user) {
-  const prizeDate = beijingToday(); // supplementDate 取当前日期 YYYY-MM-DD
-  const signatureParam = `appId=${APP_ID}&nonce=${uuid()}&timestamp=${Date.now()}`;
-  const toSign = `supplementDate=${prizeDate}` + signatureParam + APP_SECRET;
-  // 与 makeSign 同型：md5(sha1(...))，但待签串前缀含 supplementDate
-  const sha1Hex = crypto.createHash('sha1').update(toSign, 'utf8').digest('hex');
-  const sign = crypto.createHash('md5').update(sha1Hex, 'utf8').digest('hex');
-  const url = `${BASE_URL}/cfmotoservermine/signin/supplementPrize?supplementDate=${prizeDate}`;
-  const headers = {
-    ...buildHeaders(authToken, signatureParam, sign),
-    user_id: user.id,
-    'Content-Length': '0',
-  };
-  const res = await request(url, { method: 'GET', headers });
-  if (res && res.code === '10000') return `盲盒领取成功：${res.prizesName || ''}`;
-  return `盲盒未领取（${res ? res.code + ' ' + (res.message || '') : '无响应'}）`;
+  const res = await signedRequest('GET', '/cfmotoservermine/H5/signin/lottery?boxType=0', authToken, {
+    userId: user.id,
+  });
+  const code = String((res && res.code) || '');
+  if (code === '10000') {
+    const d = (res && res.data) || {};
+    const prize =
+      d.prizesName ||
+      d.prizeName ||
+      (d.signPrizesVO && (d.signPrizesVO.prizesName || d.signPrizesVO.prizeName)) ||
+      d.integral ||
+      d.integralScore ||
+      d.score ||
+      '';
+    return `盲盒领取成功${prize ? '：' + prize : ''}`;
+  }
+  if (code === 'ALREADY_LOTTERY') return '今日盲盒已开过';
+  if (code === 'NO_LOTTERY') return '今天无可用盲盒';
+  return `盲盒未领取（${code} ${(res && (res.message || res.msg)) || ''}）`;
 }
 
 // ====== 社区任务：点赞 / 发帖 / 分享 / 删帖 ======
@@ -337,6 +339,8 @@ async function runCommunityTasks(authToken, user, tag) {
   }
 
   // 1) 发帖：POST commonArticle，body = { postcontent }；当天已发则跳过（避免堆积测试帖）
+  //    postedNow 用于后续删除判断：只删本次新建的帖子，绝不删当天已有的真实动态。
+  let postedNow = false;
   if (COMMUNITY_ENABLED.post) {
     const already = await hasPostedToday(authToken, user.id);
     if (already) {
@@ -345,6 +349,7 @@ async function runCommunityTasks(authToken, user, tag) {
       try {
         const res = await socialRequest('POST', '/commonArticle', authToken, { body: { postcontent: '开心的一天' } });
         const ok = res && res.code === '10000';
+        if (ok) postedNow = true;
         lines.push(`[发帖] ${ok ? '成功' : `失败 ${JSON.stringify(res).slice(0, 120)}`}`);
       } catch (e) {
         lines.push(`[发帖] 异常：${e.message}`);
@@ -391,17 +396,22 @@ async function runCommunityTasks(authToken, user, tag) {
     }
   }
 
-  // 5) 删除（清理自己发的测试帖）：DELETE commonArticle/deleteArticle
-  //    ⚠️ query 必须走 params 传入：socialRequest 在无 body 时用 params 拼出的 query 参与签名，
-  //       若把 query 直接拼在 path 里，签名体为空 → 服务端返回 30121
+  // 5) 删除（只清理本次脚本新建的测试帖）：DELETE commonArticle/deleteArticle
+  //    - 只有本轮确实发帖成功（postedNow）才删除；当天原本就有动态时绝不删除。
+  //    - query 必须走 params 传入：socialRequest 在无 body 时用 params 拼出的 query 参与签名，
+  //      若把 query 直接拼在 path 里，签名体为空 → 服务端返回 30121
   if (COMMUNITY_ENABLED.del) {
-    try {
-      const res = await socialRequest('DELETE', '/commonArticle/deleteArticle', authToken, {
-        params: { articleId: postId, postType: 1 },
-      });
-      lines.push(`[删除] ${res && res.code === '10000' ? '成功' : `失败 ${JSON.stringify(res).slice(0, 80)}`}`);
-    } catch (e) {
-      lines.push(`[删除] 异常：${e.message}`);
+    if (!postedNow) {
+      lines.push('[删除] 本次未发帖，跳过删除（避免误删当天真实动态）');
+    } else {
+      try {
+        const res = await socialRequest('DELETE', '/commonArticle/deleteArticle', authToken, {
+          params: { articleId: postId, postType: 1 },
+        });
+        lines.push(`[删除] ${res && res.code === '10000' ? '成功' : `失败 ${JSON.stringify(res).slice(0, 80)}`}`);
+      } catch (e) {
+        lines.push(`[删除] 异常：${e.message}`);
+      }
     }
   }
 
